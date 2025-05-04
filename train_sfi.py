@@ -380,16 +380,11 @@ def main():
         if idx % world_size != rank:
             continue
         local_results.append(run_trial(params, tasks, device))
+    df = pd.DataFrame(local_results)
 
-    # Gather results from all ranks
-    all_results = [None] * world_size
-    dist.all_gather_object(all_results, local_results)
 
-    # Only rank 0 aggregates and displays
-    if rank == 0:
-        flat = [r for sub in all_results for r in sub]
-        df = pd.DataFrame(flat)
-        print(df)
+    out_file = f"sweep_results_rank{rank}.csv"
+    df.to_csv(out_file, index=False)
 
     dist.destroy_process_group()
 
