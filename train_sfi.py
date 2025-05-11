@@ -152,11 +152,13 @@ class PermutedMNIST(Dataset):
 
 
 
+
+
 def train_sfi(
     model, tasks, device,
-    lambda_anchor=1.0, lambda_kl=0.1, lambda_sp=0.01,
-    lambda_rep=1.0, lambda_distill=1.0,
-    lambda_div=0.1, margin=1.0,
+    lambda_anchor=1.0, lambda_kl=0, lambda_sp=0.01,
+    lambda_rep=0, lambda_distill=0,
+    lambda_div=1, margin=10.0,
     replay_capacity=2000, replay_batch=64,
     max_snapshots=8
 ):
@@ -234,6 +236,7 @@ def train_sfi(
             loss_div = torch.tensor(0.0, device=device)
             if noise_protos:
                 for (mu1_p, sig1_p, mu2_p, sig2_p) in noise_protos:
+                    #print(mu1_p, sig1_p, mu2_p, sig2_p)
                     d_mu1 = torch.norm(mu1_cur - mu1_p, p=2)
                     d_s1  = torch.norm(sig1_cur - sig1_p, p=2)
                     d_mu2 = torch.norm(mu2_cur - mu2_p, p=2)
@@ -337,90 +340,260 @@ def run_trial(params, tasks, device):
     row['avg_acc'] = sum(eval_accs) / len(eval_accs)
     return row
 
-def main():
-    # rank = thread_num() i guess? 
-    dist.init_process_group(backend='nccl', init_method='env://')
-    rank = dist.get_rank()
-    print(rank)
-    world_size = dist.get_world_size()
+# def main():
+#     # rank = thread_num() i guess? 
+#     dist.init_process_group(backend='nccl', init_method='env://')
+#     rank = dist.get_rank()
+#     print(rank)
+#     world_size = dist.get_world_size()
 
-    # Number of GPUs and runs per GPU
-    num_gpus = torch.cuda.device_count()
-    runs_per_gpu = world_size // num_gpus
+#     # Number of GPUs and runs per GPU
+#     num_gpus = torch.cuda.device_count()
+#     runs_per_gpu = world_size // num_gpus
 
-    # Map each process to a GPU in a round-robin fashion
-    local_gpu = rank % num_gpus
-    torch.cuda.set_device(local_gpu)
-    device = torch.device(f'cuda:{local_gpu}')
+#     # Map each process to a GPU in a round-robin fashion
+#     local_gpu = rank % num_gpus
+#     torch.cuda.set_device(local_gpu)
+#     device = torch.device(f'cuda:{local_gpu}')
 
-    # Build parameter grid
-    param_grid = {
-        'lambda_anchor':    [0.01, 0.1, 1.0],
-        'lambda_kl':        [0.001, 0.01],
-        'lambda_sp':        [1e-4, 1e-3],
-        'lambda_rep':       [0.01, 0.1],
-        'lambda_distill':   [0.01, 0.1],
-        'lambda_div':       [0.001, 0.01],
-    }
-    grid = list(ParameterGrid(param_grid))
-    print(f"Total combinations: {len(grid)}")
+#     # Build parameter grid
+#     param_grid = {
+#         'lambda_anchor':    [0.01, 0.1, 1.0],
+#         'lambda_kl':        [0.001, 0.01],
+#         'lambda_sp':        [1e-4, 1e-3],
+#         'lambda_rep':       [0.01, 0.1],
+#         'lambda_distill':   [0.01, 0.1],
+#         'lambda_div':       [0.001, 0.01],
+#     }
+#     grid = list(ParameterGrid(param_grid))
+#     print(f"Total combinations: {len(grid)}")
 
-    # Prepare tasks once
-    base_ds = MNIST('./data', train=True, download=True, transform=ToTensor())
-    T = 10
-    perms = [torch.randperm(784) for _ in range(T)]
-    tasks = [
-        DataLoader(PermutedMNIST(base_ds, p), batch_size=128, shuffle=True, drop_last=True)
-        for p in perms
-    ]
+#     # Prepare tasks once
+#     base_ds = MNIST('./data', train=True, download=True, transform=ToTensor())
+#     T = 10
+#     perms = [torch.randperm(784) for _ in range(T)]
+#     tasks = [
+#         DataLoader(PermutedMNIST(base_ds, p), batch_size=128, shuffle=True, drop_last=True)
+#         for p in perms
+#     ]
 
-    # Each rank handles a subset of the grid
-    local_results = []
-    for idx, params in enumerate(grid):
-        if idx % world_size != rank:
-            continue
-        local_results.append(run_trial(params, tasks, device))
-    df = pd.DataFrame(local_results)
-
-
-    out_file = f"sweep_results_rank{rank}.csv"
-    df.to_csv(out_file, index=False)
-
-    dist.destroy_process_group()
-
-if __name__ == "__main__":
-    main()
-
-# from torchvision.transforms import ToTensor
-
-# # Download MNIST
-# train_dataset = MNIST(root='./data', train=True, download=True, transform=ToTensor())
-
-# # Create T tasks (each with a random permutation)
-# T = 10 # Number of tasks
-# tasks = []
-# perms = [] 
-# for _ in range(T):
-#     perm = torch.randperm(784)  # Random pixel permutation
-#     perms.append(perm)
-#     task_dataset = PermutedMNIST(train_dataset, perm)
-#     task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
-#     tasks.append(task_loader)
-
-# # Initialize model
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# model = SFI_MLP().to(device)
-
-# # Train
-# train_sfi(model, tasks, device)
+#     # Each rank handles a subset of the grid
+#     local_results = []
+#     for idx, params in enumerate(grid):
+#         if idx % world_size != rank:
+#             continue
+#         local_results.append(run_trial(params, tasks, device))
+#     df = pd.DataFrame(local_results)
 
 
-# tasks = []
-# for i in range(T):
-#     perm = perms[i]
-#     task_dataset = PermutedMNIST(train_dataset, perm)
-#     task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
-#     tasks.append(task_loader)
-# # --- after training ---
-# evaluate_sfi(model, tasks, device, num_batches=3)
+#     out_file = f"sweep_results_rank{rank}.csv"
+#     df.to_csv(out_file, index=False)
+
+#     dist.destroy_process_group()
+
+# if __name__ == "__main__":
+#     main()
+
+from torchvision.transforms import ToTensor
+
+# Download MNIST
+train_dataset = MNIST(root='./data', train=True, download=True, transform=ToTensor())
+
+# Create T tasks (each with a random permutation)
+T = 5# Number of tasks
+tasks = []
+perms = [] 
+for _ in range(T):
+    perm = torch.randperm(784)  # Random pixel permutation
+    perms.append(perm)
+    task_dataset = PermutedMNIST(train_dataset, perm)
+    task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
+    tasks.append(task_loader)
+
+# Initialize model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = SFI_MLP().to(device)
+
+# Train
+train_sfi(model, tasks, device)
+
+# -----------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# t-SNE (3-D) visualisation of SFI activations
+# ─────────────────────────────────────────────────────────────
+import torch
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D   # noqa: F401
+
+device = next(model.parameters()).device
+
+# 1.  Register a hook for the *post-noise* activations of SFI-2
+acts, task_ids = [], []
+
+def hook_sfi2(mod, inp, out):
+    h = out[0].detach().cpu()       # out = (h, α, μ, σ)
+    acts.append(h)
+
+h = model.sfi2.register_forward_hook(hook_sfi2)
+
+# 2.  Collect ONE batch per task (keeps memory & run-time low)
+model.eval()
+with torch.no_grad():
+    for tid, loader in enumerate(tasks):
+        X, _ = next(iter(loader))
+        task_ids.extend([tid]*X.size(0))
+        _ = model(X.to(device))     # triggers the hook
+
+H   = torch.cat(acts, 0).numpy()    # [N, hidden_dim]
+labs = np.array(task_ids)
+
+# 3.  t-SNE → 3-D
+tsne = TSNE(n_components=3,
+            perplexity=30,
+            learning_rate="auto",
+            init="random",
+            random_state=0)
+H_3d = tsne.fit_transform(H)        # [N, 3]
+
+# 4.  3-D scatter (default colour cycle handles palette)
+fig = plt.figure(figsize=(8, 6))
+ax  = fig.add_subplot(projection='3d')
+for tid in range(len(tasks)):
+    sel = labs == tid
+    ax.scatter(H_3d[sel, 0], H_3d[sel, 1], H_3d[sel, 2],
+               s=12, alpha=0.7, label=f"task {tid}")
+ax.set_title("t-SNE (3-D) of SFI layer-2 activations")
+ax.set_xlabel("t-SNE-1"); ax.set_ylabel("t-SNE-2"); ax.set_zlabel("t-SNE-3")
+ax.legend()
+plt.tight_layout()
+plt.savefig("tsne_activations.png")
+
+# 5.  Clean-up
+h.remove()
+model.train()
+
+
+
+# ─────────────────────────────────────────────────────────────
+# t‑SNE (3‑D) of SFI layer‑2 activations
+# Colour = CLASS hue, gradient shade encodes TASK index
+# ─────────────────────────────────────────────────────────────
+import torch, numpy as np, matplotlib.pyplot as plt, colorsys
+from sklearn.manifold import TSNE
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+device = next(model.parameters()).device
+
+# 1. Capture post‑noise activations with forward hook
+acts, class_ids, task_ids = [], [], []
+
+def hook_sfi2(mod, ins, outs):
+    acts.append( outs[0].detach().cpu() )   # h tensor
+
+handle = model.sfi2.register_forward_hook(hook_sfi2)
+
+# 2. Iterate ONE batch per task, record labels + task idx
+model.eval()
+with torch.no_grad():
+    for tid, loader in enumerate(tasks):
+        X, y = next(iter(loader))
+        class_ids.extend( y.tolist() )
+        task_ids.extend( [tid]*y.size(0) )
+        _ = model( X.to(device) )
+
+# tensors → numpy
+H = torch.cat(acts,0).numpy().astype(np.float32)
+cls = np.array(class_ids)
+tsk = np.array(task_ids)
+T   = tsk.max()+1
+
+# 3. t‑SNE → 3‑D
+H3d = TSNE(n_components=3, perplexity=30, init="random",
+           learning_rate="auto", random_state=0).fit_transform(H)
+
+# 4. Build colour map: tab10 hue per class + lightness gradient over task
+base_colors = plt.cm.tab10(np.linspace(0,1,10))  # RGBA
+def shade(color_rgba, task_idx):
+    r,g,b, _ = color_rgba
+    h,l,s = colorsys.rgb_to_hls(r,g,b)
+    # linearly vary lightness across tasks: older task = darker
+    l_new = 0.4 + 0.4*(task_idx / max(T-1,1))     # l in [0.4,0.8]
+    r2,g2,b2 = colorsys.hls_to_rgb(h, l_new, s)
+    return (r2,g2,b2,0.8)
+
+colors = np.array([ shade(base_colors[c], t) for c,t in zip(cls, tsk) ])
+
+# 5. 3‑D scatter
+fig = plt.figure(figsize=(8,6))
+ax  = fig.add_subplot(projection='3d')
+ax.scatter(H3d[:,0], H3d[:,1], H3d[:,2],
+           s=14, c=colors, alpha=0.9)
+
+# build legend patches: show gradient for class 0 as example
+from matplotlib.patches import Patch
+legend_patches=[]
+for c in range(10):
+    legend_patches.append( Patch(color=shade(base_colors[c], T-1), label=f"class {c}") )
+ax.legend(handles=legend_patches, title="Hue = class\nShade = task", bbox_to_anchor=(1.05,1), loc="upper left")
+
+ax.set_title("t‑SNE (3‑D): class hue, task gradient")
+ax.set_xlabel("t‑SNE‑1"); ax.set_ylabel("t‑SNE‑2"); ax.set_zlabel("t‑SNE‑3")
+plt.tight_layout()
+plt.savefig("tsne_class_task_gradient.png")
+plt.show()
+
+# 6. Clean‑up
+handle.remove()
+
+
+
+
+# ─────────────────────────────────────────────────────────────
+# PCA visualisation of task-embeddings (r) for each task
+# ─────────────────────────────────────────────────────────────
+import torch, matplotlib.pyplot as plt, numpy as np
+from sklearn.decomposition import PCA
+
+device = next(model.parameters()).device
+
+# 1) grab one batch per task
+model.eval()
+reps, task_ids = [], []
+with torch.no_grad():
+    for tid, loader in enumerate(tasks):
+        X, _ = next(iter(loader))                # one mini-batch / task
+        r = model.forward_features(X.to(device)) # [B, task_rep_dim]
+        reps.append(r.cpu())
+        task_ids.extend([tid]*X.size(0))
+R   = torch.cat(reps, 0).numpy()                 # [N, d]
+labels = np.array(task_ids)
+
+# 2) PCA → 2-D
+pca  = PCA(n_components=2, random_state=0)
+R2d  = pca.fit_transform(R)
+print(f"Variance captured by first 2 PCs: {pca.explained_variance_ratio_.sum():.1%}")
+
+# 3) scatter
+plt.figure(figsize=(6,5))
+palette = plt.cm.get_cmap("tab10", len(tasks))
+for tid in range(len(tasks)):
+    idx = labels == tid
+    plt.scatter(R2d[idx,0], R2d[idx,1], s=12, alpha=0.7,
+                color=palette(tid), label=f"task {tid}")
+plt.title("PCA (2-D) of per-sample task embeddings")
+plt.xlabel("PC-1"); plt.ylabel("PC-2")
+plt.legend(); plt.tight_layout(); plt.savefig("task_embeddings.png")
+
+model.train();
+
+
+tasks = []
+for i in range(T):
+    perm = perms[i]
+    task_dataset = PermutedMNIST(train_dataset, perm)
+    task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
+    tasks.append(task_loader)
+# --- after training ---
+evaluate_sfi(model, tasks, device, num_batches=3)
 
