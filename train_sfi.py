@@ -157,7 +157,7 @@ class PermutedMNIST(Dataset):
 def train_sfi(
     model, tasks, device,
     lambda_anchor=1.0, lambda_kl=0, lambda_sp=0.01,
-    lambda_rep=0, lambda_distill=0,
+    lambda_rep=0.5, lambda_distill=0,
     lambda_div=1, margin=10.0,
     replay_capacity=2000, replay_batch=64,
     max_snapshots=8
