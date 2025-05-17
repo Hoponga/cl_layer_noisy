@@ -137,6 +137,7 @@ def sliced_wasserstein(h_cur, h_froz, n_projs=10):
             torch.sort(p_froz,0)[0]
         ))
     return loss / n_projs
+
 class PermutedMNIST(Dataset):
     """Creates a permuted MNIST task with a fixed pixel permutation."""
     def __init__(self, original_dataset, permutation):
@@ -149,6 +150,33 @@ class PermutedMNIST(Dataset):
     
     def __len__(self):
         return len(self.dataset)
+
+class SplitMNIST(Dataset):
+    """Like PermutedMNIST but only keeps a subset of classes, returns labels 0–9."""
+    def __init__(self, original_dataset, classes):
+        """
+        original_dataset: torchvision.datasets.MNIST instance
+        classes: iterable of digit labels to include, e.g. [0,1]
+        """
+        self.dataset = original_dataset
+        # ensure classes is a Python set of ints
+        self.classes = set(int(c) for c in classes)
+        # collect indices whose labels are in `classes`
+        self.indices = [
+            idx for idx, (_, label) in enumerate(self.dataset)
+            if int(label) in self.classes
+        ]
+        if not self.indices:
+            raise ValueError(f"No examples found for classes {classes}")
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        img, label = self.dataset[self.indices[index]]
+        # flatten exactly like PermutedMNIST
+        flat = img.view(-1)       # → Tensor of shape [784]
+        return flat, label
 
 
 
@@ -401,14 +429,23 @@ train_dataset = MNIST(root='./data', train=True, download=True, transform=ToTens
 
 # Create T tasks (each with a random permutation)
 T = 5# Number of tasks
+PERMUTED = False
 tasks = []
 perms = [] 
-for _ in range(T):
-    perm = torch.randperm(784)  # Random pixel permutation
-    perms.append(perm)
-    task_dataset = PermutedMNIST(train_dataset, perm)
-    task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
-    tasks.append(task_loader)
+if PERMUTED:
+    for _ in range(T):
+        perm = torch.randperm(784)  # Random pixel permutation
+        perms.append(perm)
+        task_dataset = PermutedMNIST(train_dataset, perm)
+        task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
+        tasks.append(task_loader)
+else:
+    for i in range(T):
+        perm = torch.randperm(10)[:2]  # Random pixel permutation
+        perms.append(perm)
+        task_dataset = SplitMNIST(train_dataset, perm)
+        task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
+        tasks.append(task_loader)
 
 # Initialize model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -591,7 +628,7 @@ model.train();
 tasks = []
 for i in range(T):
     perm = perms[i]
-    task_dataset = PermutedMNIST(train_dataset, perm)
+    task_dataset = SplitMNIST(train_dataset, perm) #PermutedMNIST(train_dataset, perm)
     task_loader = DataLoader(task_dataset, batch_size=128, shuffle=True, drop_last = True)
     tasks.append(task_loader)
 # --- after training ---
