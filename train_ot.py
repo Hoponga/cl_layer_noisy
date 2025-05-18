@@ -10,8 +10,8 @@ import random, numpy as np
 T             = 5          # tasks / permutations
 BATCH         = 128
 REPLAY_MB     = 128 #512
-REPLAY_CAP    = 4096*32
-D_CLS, D_TSK  = 128, 10
+REPLAY_CAP    = 4096
+D_CLS, D_TSK  = 128, 32
 K             = T          # one prototype per task
 LR            = 1e-3
 LAM_OT        = 2.0
@@ -139,16 +139,6 @@ class ReplayBuf:
         return xs, ys
 replay = ReplayBuf(REPLAY_CAP)
 
-# ---------------- Sinkhorn ------------------------
-def sinkhorn(scores, eps=0.1, iters=3):
-    scores = scores - scores.max(1, keepdim=True).values
-    Q = torch.exp(scores / eps); Q = Q / Q.sum()
-    r = torch.ones(Q.size(0), device=scores.device) / Q.size(0)
-    c = torch.ones(Q.size(1), device=scores.device) / Q.size(1)
-    for _ in range(iters):
-        Q *= (r / (Q.sum(1)+1e-9)).unsqueeze(1)
-        Q *= (c / (Q.sum(0)+1e-9)).unsqueeze(0)
-    return Q / Q.sum()
 
 # ---------------- OT prototype head ---------------
 class OTHead(nn.Module):
@@ -188,7 +178,7 @@ class OTHead(nn.Module):
     #     hard_centroid = self.prototypes[idx]                       # [B,d]
 
     #     return ot_loss, div_loss, proto_loss, hard_centroid
-    def forward(self, z_t, replay_z=None, *, tau=0.5, eps=0.1, alpha=0.5, beta=0.1):
+    def forward(self, z_t, replay_z=None, *, tau=0.5, eps=0.1, alpha=0.5, beta=0.8):
         proto_n = F.normalize(self.prototypes, dim=1)          # [K,d]
         scores  = z_t @ proto_n.T / tau
         pbefore = self.prototypes.data.clone()                       # [B,K]
@@ -249,11 +239,13 @@ def accuracy(model, loader):
         correct += (log.argmax(1)==y).sum().item();  n += y.size(0)
     return 100*correct/n
 
+replay_buffer_freq = 1
+
 # ---------------- training loop -------------------
 def train_task(model, loader, optim, epochs=1):
     model.train()
     for _ in range(epochs):
-        for x,y in loader:
+        for i, (x,y)  in enumerate(loader):
             x,y = x.to(device), y.to(device)
 
             # replay embeddings (no grad)
@@ -269,9 +261,9 @@ def train_task(model, loader, optim, epochs=1):
             cls = F.cross_entropy(log, y)
             loss = (cls + LAM_OT*ot + LAM_DIV*div + LAM_DRIFT*proto)
             # ADDED
-            if xr is not None:
+            if xr is not None and i % replay_buffer_freq == 0:
                 logits_r, ot_r, div_r, proto_r = model(xr, replay_z=None)
-                loss += F.cross_entropy(logits_r, yr) + LAM_OT*ot_r + LAM_DIV*div_r + LAM_DRIFT*proto_r
+                loss += (F.cross_entropy(logits_r, yr) + LAM_OT*ot_r + LAM_DIV*div_r + LAM_DRIFT*proto_r)
 
             optim.zero_grad(); loss.backward(); optim.step()
             replay.add_batch(x.detach(), y.detach())

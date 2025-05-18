@@ -1,136 +1,185 @@
+# train_baseline.py – Permuted/Split MNIST (or CIFAR-10) with small replay buffer
+# -------------------------------------------------------------------------------
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision.datasets import MNIST
-from torchvision.transforms import ToTensor
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision.datasets import MNIST, CIFAR10
+from torchvision.transforms import Compose, ToTensor, Grayscale
 import random
 
-# 1) PermutedMNIST dataset wrapper
-class PermutedMNIST(Dataset):
-    def __init__(self, base_ds, perm):
-        self.base = base_ds
-        self.perm = perm
+# ---------------- hyper-parameters ----------------
+T          = 5          # number of tasks/permutations
+BATCH      = 128
+REPLAY_MB  = 128
+REPLAY_CAP = 4096*32
+LR         = 1e-3
+device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+PERMUTED   = False      # set True for Permuted-MNIST/CIFAR10
+isMNIST    = True       # set False for CIFAR-10 variants
+# --------------------------------------------------
 
+# ---------------- dataset definitions -------------
+class PermutedMNIST(Dataset):
+    def __init__(self, base, perm):
+        self.base, self.perm = base, perm
+    def __getitem__(self, idx):
+        x, y = self.base[idx]
+        return x.view(-1)[self.perm], y
     def __len__(self):
         return len(self.base)
 
+class PermutedCIFAR10(Dataset):
+    def __init__(self, base, perm):
+        self.base, self.perm = base, perm
     def __getitem__(self, idx):
-        img, lbl = self.base[idx]
-        return img.view(-1)[self.perm], lbl
+        x, y = self.base[idx]
+        return x.view(-1)[self.perm], y
+    def __len__(self):
+        return len(self.base)
 
-# 2) Simple 2-layer MLP baseline
-class MLPBaseline(nn.Module):
-    def __init__(self, input_dim=784, hidden_dim=512, num_classes=10):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.out = nn.Linear(hidden_dim, num_classes)
-        self.relu = nn.ReLU()
+class SplitMNIST(Dataset):
+    def __init__(self, base, classes):
+        self.dataset = base
+        self.classes = set(int(c) for c in classes)
+        self.indices = [i for i,(_,lbl) in enumerate(self.dataset) if int(lbl) in self.classes]
+        if not self.indices:
+            raise ValueError(f"No examples for classes {classes}")
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, i):
+        img, lbl = self.dataset[self.indices[i]]
+        return img.view(-1), lbl
 
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        return self.out(x)
+class SplitCIFAR10(Dataset):
+    def __init__(self, base, classes):
+        self.dataset = base
+        self.classes = set(int(c) for c in classes)
+        self.indices = [i for i,(_,lbl) in enumerate(self.dataset) if int(lbl) in self.classes]
+        if not self.indices:
+            raise ValueError(f"No examples for classes {classes}")
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, i):
+        img, lbl = self.dataset[self.indices[i]]
+        return img.view(-1), lbl
 
-# 3) Simple replay buffer
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.storage = []
-        self.ptr = 0
+# ---------------- prepare tasks -------------------
+# Base datasets
+mnist_base = MNIST('./data', train=True, download=True, transform=ToTensor())
+cifar_base = CIFAR10('./data', train=True, download=True,
+                     transform=Compose([Grayscale(), ToTensor()]))
 
-    def add(self, X, y):
-        X_cpu = X.detach().cpu()
-        y_cpu = y.detach().cpu()
-        for xi, yi in zip(X_cpu, y_cpu):
-            if len(self.storage) < self.capacity:
-                self.storage.append((xi, yi))
+tasks = []
+if isMNIST:
+    if PERMUTED:
+        perms = [torch.randperm(784) for _ in range(T)]
+        for p in perms:
+            ds = PermutedMNIST(mnist_base, p)
+            tasks.append(DataLoader(ds, batch_size=BATCH, shuffle=True, drop_last=True))
+    else:
+        temp = torch.randperm(10)
+        splits = [temp[i:i+2].tolist() for i in range(0,10,2)]
+        for cls in splits:
+            ds = SplitMNIST(mnist_base, cls)
+            tasks.append(DataLoader(ds, batch_size=BATCH, shuffle=True, drop_last=True))
+else:
+    if PERMUTED:
+        perms = [torch.randperm(1024) for _ in range(T)]
+        for p in perms:
+            ds = PermutedCIFAR10(cifar_base, p)
+            tasks.append(DataLoader(ds, batch_size=BATCH, shuffle=True, drop_last=True))
+    else:
+        temp = torch.randperm(10)
+        splits = [temp[i:i+2].tolist() for i in range(0,10,2)]
+        for cls in splits:
+            ds = SplitCIFAR10(cifar_base, cls)
+            tasks.append(DataLoader(ds, batch_size=BATCH, shuffle=True, drop_last=True))
+
+# ---------------- replay buffer -------------------
+class ReplayBuf:
+    def __init__(self, cap):
+        self.x, self.y, self.cap = [], [], cap
+    def add_batch(self, x, y):
+        for xi, yi in zip(x.cpu(), y.cpu()):
+            if len(self.x) < self.cap:
+                self.x.append(xi); self.y.append(int(yi))
             else:
-                self.storage[self.ptr] = (xi, yi)
-                self.ptr = (self.ptr + 1) % self.capacity
+                k = random.randrange(self.cap)
+                self.x[k] = xi; self.y[k] = int(yi)
+    def sample(self, m):
+        if not self.x: return None, None
+        idx = random.sample(range(len(self.x)), min(m, len(self.x)))
+        xs = torch.stack([self.x[i] for i in idx]).to(device)
+        ys = torch.tensor([self.y[i] for i in idx], device=device)
+        return xs, ys
 
-    def sample(self, batch_size):
-        batch = random.sample(self.storage, min(len(self.storage), batch_size))
-        Xs, ys = zip(*batch)
-        return torch.stack(Xs), torch.tensor(ys)
+replay = ReplayBuf(REPLAY_CAP)
 
-# 4) Evaluation helper
-def evaluate(model, loaders, device, num_batches=2):
+# ---------------- baseline model ------------------
+class BaselineModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 128), 
+            nn.ReLU(inplace = True), 
+            nn.Linear(128,10)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+input_dim = 784 if isMNIST else 1024
+model = BaselineModel(input_dim).to(device)
+optim = torch.optim.Adam(model.parameters(), lr=LR)
+
+# --------------- accuracy helper ------------------
+@torch.no_grad()
+def accuracy(model, loader):
     model.eval()
-    accs = []
-    with torch.no_grad():
-        for loader in loaders:
-            it = iter(loader)
-            batch_acc = []
-            for _ in range(num_batches):
-                try:
-                    X, y = next(it)
-                except StopIteration:
-                    break
-                X, y = X.to(device), y.to(device)
-                preds = model(X).argmax(dim=1)
-                batch_acc.append((preds == y).float().mean().item())
-            accs.append(sum(batch_acc) / len(batch_acc) if batch_acc else 0.0)
+    correct = total = 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        correct += (logits.argmax(1)==y).sum().item()
+        total   += y.size(0)
+    return 100 * correct / total
+
+# ---------------- training loop -------------------
+def train_task(model, loader, optim, epochs=1):
     model.train()
-    return accs
+    for _ in range(epochs):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
 
-# 5) Training loop with replay
-def train_baseline_with_replay(
-    model, task_loaders, device,
-    lr=1e-3, epochs_per_task=1,
-    replay_capacity=2000, replay_batch=64,
-    lambda_rep=1.0
-):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-    buffer = ReplayBuffer(replay_capacity)
-    seen_loaders = []
+            # sample replay batch
+            xr, yr = replay.sample(REPLAY_MB)
 
-    for task_id, loader in enumerate(task_loaders):
-        print(f"\n--- Training Task {task_id} ---")
-        seen_loaders.append(loader)
+            # forward new
+            logits = model(x)
+            loss   = F.cross_entropy(logits, y)
 
-        for epoch in range(epochs_per_task):
-            for X, y in loader:
-                X, y = X.to(device), y.to(device)
+            # forward replay
+            if xr is not None:
+                logits_r = model(xr)
+                loss    += F.cross_entropy(logits_r, yr)
 
-                # Forward on new data
-                logits = model(X)
-                loss = criterion(logits, y)
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
 
-                # Replay if buffer has enough samples
-                if len(buffer.storage) >= replay_batch:
-                    Xr, yr = buffer.sample(replay_batch)
-                    Xr, yr = Xr.to(device), yr.to(device)
-                    logits_r = model(Xr)
-                    loss_rep = criterion(logits_r, yr)
-                    loss = loss + lambda_rep * loss_rep
+            # add to buffer
+            replay.add_batch(x.detach(), y.detach())
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                # Add new batch to buffer
-                buffer.add(X, y)
-
-        # Evaluate on all seen tasks
-        accs = evaluate(model, seen_loaders, device, num_batches=3)
-        for tid, acc in enumerate(accs):
-            print(f"  Eval on Task {tid}: {acc*100:5.2f}%")
-
-    return model
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    T = 5
-    base_ds = MNIST('./data', train=True, download=True, transform=ToTensor())
-    perms = [torch.randperm(784) for _ in range(T)]
-    task_loaders = [
-        DataLoader(PermutedMNIST(base_ds, p), batch_size=128, shuffle=True, drop_last=True)
-        for p in perms
-    ]
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = MLPBaseline().to(device)
-    train_baseline_with_replay(model, task_loaders, device)
+# --------------- main continual loop ---------------
+print("Baseline continual learning with replay buffer\n")
+for t, loader in enumerate(tasks):
+    print(f"=== Task {t} ===")
+    if not PERMUTED:
+        print("Classes:", loader.dataset.classes if hasattr(loader.dataset, 'classes') else "N/A")
+    train_task(model, loader, optim, epochs=1)
+    for s in range(t+1):
+        acc = accuracy(model, tasks[s])
+        print(f"  Eval task {s}: {acc:5.2f}%")
