@@ -1,72 +1,63 @@
 # train_mean_teacher_anchor.py – MNIST / CIFAR10 CL with
 #   ↳ EMA teacher        (no slow deepcopy)
 #   ↳ per-class OT head
-#   ↳ iCaRL herding      (balanced exemplars)
+#   ↳ simple replay      (balanced exemplars)
 #   ↳ Laplacian anchoring on teacher prototypes during replay
+#   ↳ Wasserstein distillation on teacher logits
 
-import random, torch, torch.nn as nn, torch.nn.functional as F
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision.datasets import MNIST, CIFAR10
-from torchvision.transforms import Compose, ToTensor, Grayscale
+from torchvision.datasets import MNIST
+from torchvision.transforms import ToTensor
 
 # ─────────────── hyper-parameters ───────────────
 T            = 5
 BATCH        = 128
 REPLAY_MB    = 128
-REPLAY_CAP   = 4096*32            # 20 exemplars × 10 classes
-D_CLS, D_TSK = 128, 10
+REPLAY_CAP   = 4096           # total exemplars
+D_CLS, D_TSK = 128, 32
 LR           = 1e-3
-EMA_ALPHA    = 0.99
-LAM_OT       = 2.0
-LAM_M        = 5e-3             # Laplacian anchor weight
+EMA_ALPHA    = 0.91
+
+LAM_ORTHO = 1e-3 
+LAM_M        = 5e-2       # Laplacian anchor weight
+TAU          = 0.5            # temperature for distillation
 device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(device)
-isMNIST, PERMUTED = True, False
+print("Using device:", device)
+isMNIST, PERMUTED = True, True
 # ────────────────────────────────────────────────
 
-# ---------------- data loaders (unchanged) ----------------
+# -------------- data loaders --------------------
 class PMNIST(Dataset):
     def __init__(self, base, perm): self.base, self.perm = base, perm
-    def __getitem__(s, i): x,y=s.base[i];return x.view(-1)[s.perm],y
-    def __len__(s): return len(s.base)
+    def __getitem__(self, i):
+        x, y = self.base[i]
+        return x.view(-1)[self.perm], y
+    def __len__(self): return len(self.base)
+
 class SplitMNIST(Dataset):
-    def __init__(s, base, cl):
-        s.data=[(x.view(-1),y) for x,y in base if y in cl]
-    def __getitem__(s,i): return s.data[i]
-    def __len__(s): return len(s.data)
+    def __init__(self, base, classes):
+        self.data = [(x.view(-1), y) for x, y in base if y in classes]
+    def __getitem__(self, i): return self.data[i]
+    def __len__(self): return len(self.data)
+
 def get_tasks():
-    base=MNIST('./data',train=True,download=True,transform=ToTensor())
+    base = MNIST('./data', train=True, download=True, transform=ToTensor())
     if PERMUTED:
-        perms=[torch.randperm(784) for _ in range(T)]
-        return [DataLoader(PMNIST(base,p),batch_size=BATCH,shuffle=True,
-                           drop_last=True) for p in perms]
+        perms = [torch.randperm(784) for _ in range(T)]
+        return [DataLoader(PMNIST(base, p), batch_size=BATCH, shuffle=True, drop_last=True)
+                for p in perms]
     else:
-        splits=[list(range(i,i+2)) for i in range(0,10,2)]
-        return [DataLoader(SplitMNIST(base,c),batch_size=BATCH,shuffle=True,
-                           drop_last=True) for c in splits]
-tasks=get_tasks()
+        splits = [list(range(i, i+2)) for i in range(0, 10, 2)]
+        return [DataLoader(SplitMNIST(base, c), batch_size=BATCH, shuffle=True, drop_last=True)
+                for c in splits]
 
-# # ---------------- herding replay buffer ----------------
-# class HerdBuf:
-#     def __init__(s, cap_pc, model): s.cap, s.m, s.mem=cap_pc,model,{c:[] for c in range(10)}
-#     def add(s,x,y):
-#         with torch.no_grad():
-#             z=s.m.backbone(x.to(device))[:,-D_TSK:]
-#             z=F.normalize(z,1).cpu()
-#         for xi,yi,zi in zip(x.cpu(),y.cpu(),z):
-#             buf=s.mem[int(yi)]
-#             if len(buf)<s.cap: buf.append((xi,yi,zi)); continue
-#             Z=torch.stack([z for _,_,z in buf]);mu=Z.mean(0)
-#             worst=(Z-mu).norm(2,1).argmax()
-#             if (zi-mu).norm()< (Z[worst]-mu).norm(): buf[worst]=(xi,yi,zi)
-#     def sample(s,m):
-#         xs,ys=[] ,[]
-#         take=max(1,m//10)
-#         for c,buf in s.mem.items():
-#             for xi,yi,_ in random.sample(buf,min(take,len(buf))):
-#                 xs.append(xi);ys.append(yi)
-#         return (torch.stack(xs).to(device),torch.tensor(ys,device=device)) if xs else (None,None)
+tasks = get_tasks()
 
+# ---------------- replay buffer ------------------
 class ReplayBuf:
     def __init__(self, cap):
         self.x, self.y, self.cap = [], [], cap
@@ -86,86 +77,226 @@ class ReplayBuf:
 
 buf = ReplayBuf(REPLAY_CAP)
 
-# ---------------- mean-teacher helpers ----------------
-def ema(student,teacher,a=EMA_ALPHA):
-    for ps,pt in zip(student.parameters(),teacher.parameters()):
-        pt.data.mul_(a).add_(ps.data,alpha=1-a)
+# ------------- mean-teacher EMA -----------------
+def ema(student, teacher, alpha=EMA_ALPHA):
+    for ps, pt in zip(student.parameters(), teacher.parameters()):
+        pt.data.mul_(alpha).add_(ps.data, alpha=1-alpha)
 
-# ---------------- Laplacian builder on teacher prototypes ------------
+# ---------- Laplacian builder helper ------------
 def build_laplacian(P_anchor, sigma=0.5):
-    d2=torch.cdist(P_anchor,P_anchor,2).pow(2)
-    W=torch.exp(-d2/(2*sigma**2))
-    D=torch.diag(W.sum(1)); return D-W
+    d2 = torch.cdist(P_anchor, P_anchor, p=2).pow(2)
+    W  = torch.exp(-d2 / (2 * sigma**2))
+    D  = torch.diag(W.sum(dim=1))
+    return D - W
 
-# ---------------- model components --------------------
+# --------- Wasserstein distillation -------------
+def wasserstein_distill(p_new, p_old):
+    cdf_new = p_new.cumsum(dim=1)
+    cdf_old = p_old.cumsum(dim=1)
+    return (cdf_new - cdf_old).abs().sum(dim=1).mean()
+
+# ---------------- model components ---------------
 class OTHead(nn.Module):
-    def __init__(s,d,K):
-        super().__init__(); s.P=nn.Parameter(torch.randn(K,d)); nn.init.normal_(s.P)
-    def forward(s,z):
-        Pn=F.normalize(s.P,1);scr=z@Pn.T/0.5
-        Q=F.softmax(scr/0.1,1); ot=-(Q*F.log_softmax(scr,1)).sum(1).mean()
-        idx=Q.argmax(1);cent=s.P[idx]
-        return ot,cent
-class Net(nn.Module):
-    def __init__(s):
+    def __init__(self, d_tsk, K):
         super().__init__()
-        inp=784
-        s.backbone=nn.Sequential(nn.Linear(inp,256),nn.ReLU(),nn.Linear(256,D_CLS+D_TSK))
-        s.head=OTHead(D_TSK,10)
-        s.fc=nn.Linear(D_CLS+D_TSK,10)
-    def forward(s,x,replay_z=None):
-        z=s.backbone(x)
-        zc=F.normalize(z[:,:D_CLS],1);zt=F.normalize(z[:,D_CLS:],1)
-        ot,cent=s.head(zt if replay_z is None else replay_z)
-        log=s.fc(torch.cat([zc,cent.detach()],1))
-        return log,ot
-# ------------------------------------------------------
+        self.P = nn.Parameter(torch.randn(K, d_tsk))
+        nn.init.normal_(self.P)
+    def forward(self, z):
+        Pn = F.normalize(self.P, p=2, dim=1)
+        scr = z @ Pn.t() / TAU
+        Q   = F.softmax(scr / TAU, dim=1)
+        #ot  = -(Q * F.log_softmax(scr, dim=1)).sum(1).mean()
+        idx = Q.argmax(1)
+        cent = self.P[idx]
+        return cent
 
-student=Net().to(device); teacher=Net().to(device)
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        inp = 784
+        self.backbone = nn.Sequential(
+            nn.Linear(inp, 256), nn.ReLU(),
+            nn.Linear(256, D_CLS + D_TSK)
+        )
+        self.head = OTHead(D_TSK, K=10)
+        self.fc   = nn.Linear(D_CLS + D_TSK, 10)
+    def forward(self, x, replay_z=None):
+        z = self.backbone(x)
+        zc = F.normalize(z[:, :D_CLS], p=2, dim=1)
+        zt = F.normalize(z[:, D_CLS:], p=2, dim=1)
+        cent = self.head(zt if replay_z is None else replay_z)
+        logits = self.fc(torch.cat([zc, cent.detach()], dim=1))
+        return logits
+
+# -------------------------------------------------
+
+def orthogonality_loss(P, lam=LAM_ORTHO):
+    # P shape: [K, d_tsk]
+    Pn = F.normalize(P, p=2, dim=1)          # [K, d]
+    G  = Pn @ Pn.t()                         # [K, K]
+    I  = torch.eye(Pn.size(0), device=P.device)
+    return lam * ((G - I).pow(2).sum() / Pn.size(0)**2)
+
+
+
+student = Net().to(device)
+teacher = Net().to(device)
 teacher.load_state_dict(student.state_dict())
-opt=torch.optim.Adam(student.parameters(),lr=LR)
+opt = torch.optim.Adam(student.parameters(), lr=LR)
 
-# placeholders for prototype anchors
-P_anchor=None; L_anchor=None
+centroid_history = []
 
-for t,loader in enumerate(tasks):
-    print(f"\nTask {t}")
+# placeholders for anchor snapshot
+P_anchor, L_anchor = None, None
+
+# ------------------- helper ----------------------------------
+def run_tsne(data, colors, title, fname):
+    proj = TSNE(n_components=2,
+                init='pca',
+                perplexity=30,
+                random_state=0).fit_transform(data)
+    plt.figure(figsize=(5.5,5))
+    plt.scatter(proj[:,0], proj[:,1], s=8, c=colors, alpha=0.85)
+    plt.title(title); plt.xticks([]); plt.yticks([])
+    plt.tight_layout(); plt.savefig(fname, dpi=180); plt.show()
+
+for t, loader in enumerate(tasks):
+    centroid_history.append(teacher.head.P.detach().cpu())
+    print(f"\n=== Task {t} ===")
     student.train()
-    for x,y in loader:
-        x,y=x.to(device),y.to(device)
 
-        # -------- current batch -----------
-        log,ot=student(x,None); loss=F.cross_entropy(log,y)+LAM_OT*ot
+    # training epochs per task
+    for _ in range(2):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
 
-        # -------- replay branch -----------
-        xr,yr=buf.sample(REPLAY_MB)
-        if xr is not None:
-            with torch.no_grad():
-                logT,_=teacher(xr,None)
-                pT=F.softmax(logT/0.5,1)
-            logS,ot_r=student(xr,None)
-            pS=F.softmax(logS/0.5,1)
-            wd=(pS.cumsum(1)-pT.cumsum(1)).abs().sum(1).mean()
-            loss+=F.cross_entropy(logS,yr)+LAM_OT*ot_r+wd
-            # ----- manifold anchor on TEACHER prototypes -----
-            if P_anchor is not None:
-                Delta=teacher.head.P-P_anchor
-                man=torch.trace(Delta.T@L_anchor@Delta)
-                loss+=LAM_M*man
+            # current-task loss
+            logits= student(x, None)
+            loss = F.cross_entropy(logits, y) 
+            loss += orthogonality_loss(student.head.P)
 
-        opt.zero_grad();loss.backward();opt.step()
-        ema(student,teacher); buf.add(x.cpu(),y.cpu())
+            # replay + OT-distill + Laplacian anchor
+            xr, yr = buf.sample(REPLAY_MB)
+            if xr is not None:
+                # teacher soft targets
+                with torch.no_grad():
+                    logT = teacher(xr, None)
+                    pT = F.softmax(logT / TAU, dim=1)
+                # student replay outputs
+                logS = student(xr, None)
+                pS = F.softmax(logS / TAU, dim=1)
+                # Wasserstein distillation
+                wd = wasserstein_distill(pS, pT)
+                loss += F.cross_entropy(logS, yr) + wd
+                # Laplacian anchor on teacher prototypes
+                if P_anchor is not None:
+                    Delta = teacher.head.P - P_anchor
+                    man = torch.trace(Delta.t() @ L_anchor @ Delta)
+                    loss += LAM_M * man
 
-    # ------ after task: snapshot teacher prototypes & Laplacian ------
+                
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            ema(student, teacher)
+            buf.add(x.cpu(), y.cpu())
+
+    # snapshot teacher prototypes and build Laplacian
     with torch.no_grad():
-        P_anchor=teacher.head.P.detach().clone()
-        L_anchor=build_laplacian(P_anchor).to(device)
+        P_anchor = teacher.head.P.detach().clone()
+        L_anchor = build_laplacian(P_anchor).to(device)
 
-    # ------ evaluation ----------
+    # evaluation
     student.eval()
     for s in range(t+1):
-        tot=ok=0
-        for xv,yv in tasks[s]:
-            xv,yv=xv.to(device),yv.to(device)
-            pred,_=student(xv,None); ok+=(pred.argmax(1)==yv).sum().item(); tot+=len(yv)
-        print(f"  Task {s} acc: {100*ok/tot:5.2f}%")
+        correct = total = 0
+        for xv, yv in tasks[s]:
+            xv, yv = xv.to(device), yv.to(device)
+            pred = student(xv, None)
+            correct += (pred.argmax(1) == yv).sum().item()
+            total   += yv.size(0)
+        print(f" Task {s} acc: {100*correct/total:5.2f}%")
+
+
+
+# =============================================================
+# t-SNE visualisations for latent space and centroids
+#   (a) z_task  coloured by TASK
+#   (b) z_task  coloured by CLASS
+#   (c) z_class coloured by TASK
+#   (d) prototype centroids at the *start* of each task
+# -------------------------------------------------------------
+
+import torch, numpy as np, matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import seaborn as sns
+
+device = next(student.parameters()).device
+K       = 10                         # prototypes per class
+n_vis   = 512                        # how many points per task to visualise
+rng     = np.random.default_rng(0)
+
+# store centroids snapped at the *beginning* of each task
+centroid_history = []   # list of tensors [K,d_tsk]
+
+
+
+# =============================================================
+# (After training)  gather one minibatch per task
+# =============================================================
+Z_task, Z_class, task_lbls, cls_lbls = [], [], [], []
+
+student.eval()
+with torch.no_grad():
+    for tid, loader in enumerate(tasks):
+        x_all, y_all = next(iter(loader))
+        # subsample to at most n_vis points for faster t-SNE
+        idx = rng.choice(len(x_all), size=min(n_vis, len(x_all)), replace=False)
+        x, y = x_all[idx].to(device), y_all[idx].to(device)
+
+        z = student.backbone(x)                     # [B, d_cls+d_tsk]
+        Zc = F.normalize(z[:, :D_CLS], dim=1).cpu() # [B, d_cls]
+        Zt = F.normalize(z[:, D_CLS:], dim=1).cpu() # [B, d_tsk]
+
+        Z_class.append(Zc)
+        Z_task.append(Zt)
+        task_lbls.extend([tid]*len(x))
+        cls_lbls.extend(y.cpu().tolist())
+
+# concat
+Z_class = torch.cat(Z_class, 0).numpy()
+Z_task  = torch.cat(Z_task , 0).numpy()
+task_lbls = np.array(task_lbls)
+cls_lbls  = np.array(cls_lbls)
+
+# ------------------ a) z_task coloured by TASK ---------------
+colors_a = [sns.color_palette('tab10')[t] for t in task_lbls]
+run_tsne(Z_task, colors_a, "z_task   (color = TASK)", "tsne_z_task_by_task.png")
+
+# ------------------ b) z_task coloured by CLASS --------------
+colors_b = [sns.color_palette('tab10')[c] for c in cls_lbls]
+run_tsne(Z_task, colors_b, "z_task   (color = CLASS)", "tsne_z_task_by_class.png")
+
+# ------------------ c) z_class coloured by TASK --------------
+colors_c = [sns.color_palette('tab10')[t] for t in task_lbls]
+run_tsne(Z_class, colors_c, "z_class  (color = TASK)", "tsne_z_class_by_task.png")
+
+# =============================================================
+# (d)  centroid trajectory: prototypes at the START of each task
+# =============================================================
+#  → During training loop add:
+#     centroid_history.append(P_anchor.cpu())     (right after snapshot)
+#
+# Here we visualise all stored centroids:
+
+if centroid_history:     # make sure you collected them
+    all_centroids = torch.stack(centroid_history)   # [T, K, d_tsk]
+    C_flat  = all_centroids.view(-1, all_centroids.size(-1)).numpy()
+    task_id = np.repeat(np.arange(len(centroid_history)), K)
+    colors_d = [sns.color_palette('tab10')[t] for t in task_id]
+    run_tsne(C_flat, colors_d,
+             "Prototypes (at task start)  color = TASK",
+             "tsne_prototypes_by_task.png")
+else:
+    print("centroid_history is empty – did you append snapshots during training?")
