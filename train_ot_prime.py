@@ -10,7 +10,7 @@ import random, numpy as np
 T             = 5          # tasks / permutations
 BATCH         = 128
 REPLAY_MB     = 128 #512
-REPLAY_CAP    = 4096*32
+REPLAY_CAP    = 4096*2
 D_CLS, D_TSK  = 128, 10
 K             = T          # one prototype per task
 LR            = 1e-3
@@ -250,7 +250,7 @@ def accuracy(model, loader):
     return 100*correct/n
 
 # ---------------- training loop -------------------
-def train_task(model, loader, optim, epochs=1):
+def train_task(model, loader, optim, epochs=20):
     model.train()
     for _ in range(epochs):
         for x,y in loader:
