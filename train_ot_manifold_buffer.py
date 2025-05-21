@@ -206,8 +206,7 @@ class OTHead(nn.Module):
         scr = z @ Pn.t() / TAU
         Q   = F.softmax(scr / TAU, dim=1)
         #ot  = -(Q * F.log_softmax(scr, dim=1)).sum(1).mean()
-        idx = Q.argmax(1)
-        cent = self.P[idx]
+        cent = Q @ self.P 
         return cent
 
 class Net(nn.Module):
