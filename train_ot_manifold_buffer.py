@@ -17,14 +17,14 @@ from torchvision.transforms import ToTensor
 T            = 10
 BATCH        = 128
 REPLAY_MB    = 128
-REPLAY_CAP   = 4096           # total exemplars
+REPLAY_CAP   = 600           # total exemplars
 D_CLS, D_TSK = 128, 32
 LR           = 1e-3
 EMA_ALPHA    = 0.98
 
 LAM_ORTHO = 0.1
-LAM_M        = 0.03     # Laplacian anchor weight
-LAM_WD       = 0.1
+LAM_M        = 1    # Laplacian anchor weight
+LAM_WD       = 1
 TAU          = 0.5            # temperature for distillation
 device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", device)
@@ -78,85 +78,104 @@ class ReplayBuf:
         return xs, ys
 
 
-class BalancedReplayBuf:
+class TaskClassReplayBuf:
     """
-    Class–balanced reservoir replay.
-    • `cap` is the *total* number of exemplars the buffer may store.
-    • When the buffer is not full it just grows.
-    • Once full, every class that has appeared so far is allotted
-        floor(cap / #seen_classes)   slots (±1 for rounding).
-    • New items replace *random* items from their own class bucket
-      (reservoir sampling) so the per–class distribution stays uniform.
+    Balanced on two axes:
+      • tasks   (domain IDs 0 … T-1)
+      • classes (label IDs 0 … C-1)
+
+    API:
+        buf = TaskClassReplayBuf(capacity, n_classes, device)
+        buf.add(x, y, task_id)          # x:[B,…], y:[B]
+        xs, ys = buf.sample(batch)      # balanced task×class mini-batch
     """
-    def __init__(self, cap, device=torch.device("cpu")):
+
+    def __init__(self, cap, n_classes, device=torch.device("cpu")):
         self.cap     = cap
-        self.device  = device         # for `.sample()`
-        self.store   = {}             # cls → [tensor, …]
+        self.C       = n_classes
+        self.device  = device
+        # storage:  dict[task][cls] -> list[tensor]
+        self.store   = {}
 
-    # ---------- helpers ----------
-    def _bucket_cap(self):
-        """current max size of each class bucket"""
-        return max(1, self.cap // len(self.store))
+    # ------------ internal helpers ----------------
+    def _cell_cap(self):
+        """current quota per (task,class) cell"""
+        if not self.store:
+            return self.cap   # before first task
+        return max(1, self.cap // (len(self.store) * self.C))
 
-    def _total_size(self):
-        return sum(len(v) for v in self.store.values())
+    def _trim_if_needed(self):
+        """after inserting; drop random items until global size ≤ cap"""
+        cell_cap = self._cell_cap()
+        while self._total_items() > self.cap:
+            for t in list(self.store):
+                for c in range(self.C):
+                    bucket = self.store[t].get(c, [])
+                    while len(bucket) > cell_cap:
+                        bucket.pop(random.randrange(len(bucket)))
+                    if self._total_items() <= self.cap:
+                        return
 
-    # ---------- public API ----------
-    def add(self, xs, ys):
+    def _total_items(self):
+        return sum(len(b) for task in self.store.values()
+                          for b in task.values())
+
+    # ------------ public API -----------------------
+    @torch.no_grad()
+    def add(self, xs, ys, task_id):
         """
-        xs : Tensor [B, …]  (CPU or GPU)
-        ys : Tensor [B]     (CPU or GPU)
+        xs: Tensor [B,…]  (CPU or GPU)
+        ys: Tensor [B]
+        task_id: int      (domain index of the current batch)
         """
-        for x, y in zip(xs.cpu(), ys.cpu()):
+        xs, ys = xs.cpu(), ys.cpu()
+
+        if task_id not in self.store:               # new task → new row
+            self.store[task_id] = {c: [] for c in range(self.C)}
+
+        cell_cap = self._cell_cap()
+
+        for x, y in zip(xs, ys):
             c = int(y)
-
-            # ensure bucket exists
-            if c not in self.store:
-                self.store[c] = []
-
-            bucket = self.store[c]
-            b_cap  = self._bucket_cap()
-
-            if len(bucket) < b_cap:               # room inside bucket
+            bucket = self.store[task_id][c]
+            if len(bucket) < cell_cap:              # free slot
                 bucket.append(x.clone())
-            else:                                 # bucket full → reservoir replace
-                k = random.randrange(len(bucket))
+            else:                                   # reservoir replace
+                k = random.randrange(cell_cap)
                 bucket[k] = x.clone()
 
-            # global overflow possible *only* when a NEW class appeared:
-            while self._total_size() > self.cap:
-                # trim random items from buckets that exceed the new cap
-                for cls, buf in list(self.store.items()):
-                    b_cap = self._bucket_cap()
-                    while len(buf) > b_cap:
-                        buf.pop(random.randrange(len(buf)))
-                    if self._total_size() <= self.cap:
-                        break
+        # After possibly adding a NEW TASK the per-cell cap may shrink.
+        self._trim_if_needed()
 
     def sample(self, m):
         """
-        Balanced sampling: try to draw ⌈m / #seen⌉ per class.
+        Balanced Sampling: equal #tasks → equal #classes.
         """
-        if self._total_size() == 0:
+        if self._total_items() == 0:
             return None, None
 
-        per = max(1, m // len(self.store))
+        tasks = list(self.store.keys())
+        per_task = max(1, m // len(tasks))
         xs, ys = [], []
-        for cls, buf in self.store.items():
-            if not buf:
-                continue
-            idxs = random.sample(range(len(buf)), min(per, len(buf)))
-            xs.extend(buf[i] for i in idxs)
-            ys.extend([cls] * len(idxs))
+        for t in tasks:
+            per_cls = max(1, per_task // self.C)
+            for c in range(self.C):
+                bucket = self.store[t].get(c, [])
+                if not bucket:
+                    continue
+                k = min(per_cls, len(bucket))
+                idx = random.sample(range(len(bucket)), k)
+                xs.extend(bucket[i] for i in idx)
+                ys.extend([c] * k)
 
-        if not xs:   # shouldn’t happen, but be safe
+        if not xs:
             return None, None
-
         xs = torch.stack(xs).to(self.device)
         ys = torch.tensor(ys, device=self.device)
         return xs, ys
 
-buf = BalancedReplayBuf(REPLAY_CAP, device = device)
+
+buf = TaskClassReplayBuf(REPLAY_CAP, 10, device = device)
 
 # ------------- mean-teacher EMA -----------------
 def ema(student, teacher, alpha=EMA_ALPHA):
@@ -199,7 +218,7 @@ class Net(nn.Module):
             nn.Linear(inp, 256), nn.ReLU(),
             nn.Linear(256, D_CLS + D_TSK)
         )
-        self.head = OTHead(D_TSK, K=10)
+        self.head = OTHead(D_TSK, K=15)
         self.fc   = nn.Linear(D_CLS + D_TSK, 10)
     def forward(self, x, replay_z=None):
         z = self.backbone(x)
@@ -288,7 +307,7 @@ for t, loader in enumerate(tasks):
             opt.step()
 
             ema(student, teacher)
-            buf.add(x.cpu(), y.cpu())
+            buf.add(x.cpu(), y.cpu(), t)
 
     # snapshot teacher prototypes and build Laplacian
     with torch.no_grad():
