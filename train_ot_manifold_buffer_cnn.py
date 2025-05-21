@@ -18,7 +18,7 @@ T            = 5
 BATCH        = 128
 REPLAY_MB    = 128
 REPLAY_CAP   = 600           # total exemplars
-D_CLS, D_TSK = 128, 32
+D_CLS, D_TSK = 64, 192
 LR           = 1e-3
 EMA_ALPHA    = 0.98
 
@@ -40,10 +40,25 @@ class PMNIST(Dataset):
     def __len__(self): return len(self.base)
 
 class PermutedCIFAR10(Dataset):
-    def __init__(self, base, perm): self.base, self.perm = base, perm
-    def __getitem__(self, idx):
-        x,y = self.base[idx];  return x[:, self.perm], y
-    def __len__(self): return len(self.base)
+    def __init__(self, base, perm):
+        """
+        Args:
+            base: The base CIFAR-10 dataset (e.g., torchvision.datasets.CIFAR10).
+            perm: A 1D permutation tensor of size 32*32 = 1024, to apply to each channel.
+        """
+        assert perm.shape[0] == 32 * 32, "Permutation must be of length 1024"
+        self.base = base
+        self.perm = perm
+
+    def __getitem__(self, i):
+        x, y = self.base[i]  # x: [3, 32, 32], y: label
+        x = x.view(3, -1)     # Flatten spatial dims, shape: [3, 1024]
+        x = x[:, self.perm]   # Apply the same permutation to each channel
+        x = x.view(3, 32, 32) # Reshape back to image shape
+        return x, y
+
+    def __len__(self):
+        return len(self.base)
 
 class SplitMNIST(Dataset):
     def __init__(self, base, classes):
@@ -256,6 +271,68 @@ class OTHead(nn.Module):
         cent = Q @ self.P
         return cent
 
+#### RESNET #####
+
+class ResidualBlock(nn.Module):
+    def __init__(self, inchannel, outchannel, stride=1):
+        super(ResidualBlock, self).__init__()
+        self.left = nn.Sequential(
+            nn.Conv2d(inchannel, outchannel, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(outchannel),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(outchannel, outchannel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(outchannel)
+        )
+        self.shortcut = nn.Sequential()
+        if stride != 1 or inchannel != outchannel:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(inchannel, outchannel, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(outchannel)
+            )
+            
+    def forward(self, x):
+        out = self.left(x)
+        out = out + self.shortcut(x)
+        out = F.relu(out)
+        
+        return out
+
+class ResNet(nn.Module):
+    def __init__(self, ResidualBlock, num_classes=10):
+        super(ResNet, self).__init__()
+        self.inchannel = 64
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU()
+        )
+        self.layer1 = self.make_layer(ResidualBlock, 64, 2, stride=1)
+        self.layer2 = self.make_layer(ResidualBlock, 128, 2, stride=2)
+        self.layer3 = self.make_layer(ResidualBlock, 256, 2, stride=2)        
+        self.layer4 = self.make_layer(ResidualBlock, 512, 2, stride=2)        
+        self.fc = nn.Linear(512, num_classes)
+        
+    def make_layer(self, block, channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.inchannel, channels, stride))
+            self.inchannel = channels
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        #out = self.fc(out)
+        return out
+
+####
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -361,50 +438,16 @@ class SimpleDLA(nn.Module):
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
-        inc = 3
-        outc = 256
-        self.cnn = nn.Sequential(
-            # block 1
-            nn.Conv2d(inc, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # block 2
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout2d(0.05),
-
-            # block 3
-            nn.Conv2d(128, outc, kernel_size=3, padding=1),
-            nn.BatchNorm2d(outc),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(outc, outc, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-
-        # inp = 4096
-        # self.backbone = nn.Sequential(
-        #     nn.Dropout(0.1),
-        #     nn.Linear(inp, 512), nn.ReLU(),
-        #     nn.Linear(512, 256), nn.ReLU(),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(256, D_CLS + D_TSK)
-        # )
         self.backbone = nn.Sequential(
-            nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, D_CLS + D_TSK)
+            #nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(512, D_CLS + D_TSK), nn.ReLU()
         )
-        self.input_blk = SimpleDLA()
-        self.head = OTHead(D_TSK, K=15)
-        self.fc   = nn.Linear(D_CLS + D_TSK, 10)
+        self.input_blk = ResNet(ResidualBlock) #SimpleDLA()
+        self.head = OTHead(D_TSK, K=50)
+        self.fc   = nn.Sequential(
+            nn.Linear(D_CLS + D_TSK, 64), nn.ReLU(),
+            nn.Linear(64, 10)
+        )
     def forward(self, x, replay_z=None):
         # z_imm = self.cnn(x)
         # z_flat = z_imm.view(z_imm.size(0), -1)
