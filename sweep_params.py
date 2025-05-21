@@ -1,90 +1,95 @@
-import os, csv, itertools, datetime, json, torch, torch.multiprocessing as mp
-from single_train_camel import train_and_eval        # <- you write this
-import numpy as np
+#!/usr/bin/env python
+"""
+Launch a hyper-parameter sweep where **multiple independent runs
+share the same GPU concurrently**.
 
-# ------------------------------------------------------------------
-#  grid  -- change lambdas here if you want more/other values
-# ------------------------------------------------------------------
-K_vals        = [10, 15]
-D_tsk_vals    = [32, 48]
-lambda_tuples = [(0.05, .5, .5),
-                 (0.10, 1., 1.),
-                 (0.20, 2., 2.)]
+• Each worker picks     gpu_id = local_rank % N_GPUS
+• It sets `torch.cuda.set_device(gpu_id)`          (no DDP)
+• Calls mean_teacher.train_and_eval(cfg)
+• Writes one CSV line with per-task + average accuracy.
 
-lam_vals = np.logspace(-3, 0, num=4, base=10.0)    # [0.001, 0.01, 0.1, 1.0]
+You control *how many* workers per GPU with `WORKERS_PER_GPU`.
+"""
 
-#  all 4×4×4 = 64 combinations
-lambda_tuples = list(itertools.product(lam_vals, lam_vals, lam_vals))
+import os, csv, itertools, datetime, random, socket
+import multiprocessing as mp
+import torch
+from single_train_camel import train_and_eval          # your model file
+
+# ---------------- hyper-parameter grid ------------------------
+K_vals        = [10, 15, 20]
+D_TSK_vals    = [32, 48, 64]
+
+#  three orders of magnitude sweep: 10⁻³, 10⁻², 10⁻¹, 10⁰
+lam_vals      = torch.logspace(-3, 0, steps=4).tolist()   # [0.001, 0.01, 0.1, 1.0]
+
+lambda_tuples = list(itertools.product(lam_vals,
+                                       lam_vals,
+                                       lam_vals))        # 4³ = 64
+
+grid = list(itertools.product(K_vals, D_TSK_vals, lambda_tuples))
+random.shuffle(grid)           # avoid all heavy configs on same GPU
+# --------------------------------------------------------------
+
+WORKERS_PER_GPU = 8            # ← how many concurrent procs per GPU
+N_GPUS          = torch.cuda.device_count()
+TOTAL_WORKERS   = min(len(grid), N_GPUS * WORKERS_PER_GPU)
 
 
-grid = list(itertools.product(K_vals, D_tsk_vals, lambda_tuples))
-print(grid)
-# e.g.  3 * 3 * 3  = 27 jobs
-# ------------------------------------------------------------------
-
-def run_one(rank, world_size, combos):
+def worker(proc_idx, combos):
     """
-    Each DDP rank grabs one combo from `combos[rank]` and trains.
+    Simple independent worker:
+      • choose GPU
+      • run one training job
+      • write results CSV
     """
-    torch.cuda.set_device(rank)
-    torch.distributed.init_process_group("nccl",
-        rank=rank, world_size=world_size)
+    gpu_id = proc_idx % N_GPUS
+    torch.cuda.set_device(gpu_id)
 
-    # --------------- pick the combo for this rank -----------------
-    print(rank, len(combos))
-    if rank >= len(combos):
-        print(f"Rank {rank}: idle (fewer combos than GPUs)")
+    if proc_idx >= len(combos):
         return
 
-    K, D_TSK, (lam_o, lam_m, lam_wd) = combos[rank]
+    K, D_TSK, (lam_o, lam_m, lam_wd) = combos[proc_idx]
+
     cfg = dict(
-        K          = K,
-        D_TSK      = D_TSK,
-        LAM_ORTHO  = lam_o,
-        LAM_M      = lam_m,
-        LAM_WD     = lam_wd,
-        device     = f"cuda:{rank}",
-        rank       = rank,
+        K         = K,
+        D_TSK     = D_TSK,
+        LAM_ORTHO = lam_o,
+        LAM_M     = lam_m,
+        LAM_WD    = lam_wd,
+        device    = f"cuda:{gpu_id}",
     )
 
-    # --------------- do the actual training -----------------------
-    task_acc = train_and_eval(cfg)          # → list[10] of floats
-    avg_acc  = sum(task_acc) / len(task_acc)
+    print(f"starting {cfg}")
 
-    # --------------- write CSV ------------------------------------
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    fname = f"results_rank{rank}_{timestamp}.csv"
-    with open(fname, "w", newline="") as f:
-        writer = csv.writer(f)
-        header = ["K","D_TSK","lam_ortho","lam_M","lam_WD"] + \
-                 [f"task{i}" for i in range(len(task_acc))] + ["avg"]
-        writer.writerow(header)
-        writer.writerow([K, D_TSK, lam_o, lam_m, lam_wd,
-                         *[f"{a:.4f}" for a in task_acc],
-                         f"{avg_acc:.4f}"])
-    print(f"Rank {rank}: finished {cfg}  →  {fname}")
+    acc = train_and_eval(cfg)
+    avg = sum(acc)/len(acc)
 
-    torch.distributed.destroy_process_group()
+    ts  = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"run_{proc_idx:03d}_gpu{gpu_id}_{ts}.csv"
+    with open(filename, "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["K","D_TSK","lam_o","lam_m","lam_wd"] +
+                     [f"task{i}" for i in range(len(acc))] + ["avg"])
+        wr.writerow([K, D_TSK, lam_o, lam_m, lam_wd,
+                     *[f"{a:.4f}" for a in acc], f"{avg:.4f}"])
+    print(f"[PID {os.getpid()}] finished {filename}")
 
 
 if __name__ == "__main__":
-    # ----------------------------------------------------------------
-    # --------------------------------------------------------------------
-    #  Decide how many worker processes to launch
-    # --------------------------------------------------------------------
-    n_gpu      = torch.cuda.device_count()
-    n_jobs     = len(grid)
-    n_workers  = min(n_gpu, n_jobs)     # launch only what we need
+    print(f"GPUs available: {N_GPUS}")
+    print(f"Launching {TOTAL_WORKERS} workers "
+          f"({WORKERS_PER_GPU} per GPU)…")
 
-    if n_workers == 0:
-        raise RuntimeError("No CUDA devices or empty job grid!")
+    # Spawn independent processes
+    mp.set_start_method("spawn", force=True)
+    procs = []
+    for idx in range(TOTAL_WORKERS):
+        p = mp.Process(target=worker, args=(idx, grid))
+        p.start(); procs.append(p)
 
-    print(f"Launching {n_workers} workers for {n_jobs} hyper-configs "
-          f"on {n_gpu} GPU(s)")
+    # Wait for completion
+    for p in procs:
+        p.join()
 
-    mp.spawn(
-        run_one,
-        args=(n_workers, grid),   # pass the full grid; run_one will skip if rank>=len(grid)
-        nprocs=n_workers,
-        join=True
-    )
+    print("Sweep complete.")
