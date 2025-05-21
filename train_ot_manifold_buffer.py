@@ -22,8 +22,9 @@ D_CLS, D_TSK = 128, 32
 LR           = 1e-3
 EMA_ALPHA    = 0.91
 
-LAM_ORTHO = 1e-3 
-LAM_M        = 5e-2       # Laplacian anchor weight
+LAM_ORTHO = 0 
+LAM_M        = 0      # Laplacian anchor weight
+LAM_WD       = 0 
 TAU          = 0.5            # temperature for distillation
 device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", device)
@@ -186,7 +187,7 @@ for t, loader in enumerate(tasks):
                 logS = student(xr, None)
                 pS = F.softmax(logS / TAU, dim=1)
                 # Wasserstein distillation
-                wd = wasserstein_distill(pS, pT)
+                wd = LAM_WD * wasserstein_distill(pS, pT)
                 loss += F.cross_entropy(logS, yr) + wd
                 # Laplacian anchor on teacher prototypes
                 if P_anchor is not None:
