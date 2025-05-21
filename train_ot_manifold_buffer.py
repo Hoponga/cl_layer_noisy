@@ -14,17 +14,17 @@ from torchvision.datasets import MNIST
 from torchvision.transforms import ToTensor
 
 # ─────────────── hyper-parameters ───────────────
-T            = 5
+T            = 10
 BATCH        = 128
 REPLAY_MB    = 128
 REPLAY_CAP   = 4096           # total exemplars
 D_CLS, D_TSK = 128, 32
 LR           = 1e-3
-EMA_ALPHA    = 0.91
+EMA_ALPHA    = 0.98
 
-LAM_ORTHO = 0 
-LAM_M        = 0      # Laplacian anchor weight
-LAM_WD       = 0 
+LAM_ORTHO = 0.1
+LAM_M        = 0.03     # Laplacian anchor weight
+LAM_WD       = 0.1
 TAU          = 0.5            # temperature for distillation
 device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", device)
@@ -53,6 +53,7 @@ def get_tasks():
                 for p in perms]
     else:
         splits = [list(range(i, i+2)) for i in range(0, 10, 2)]
+        print(splits)
         return [DataLoader(SplitMNIST(base, c), batch_size=BATCH, shuffle=True, drop_last=True)
                 for c in splits]
 
@@ -76,7 +77,86 @@ class ReplayBuf:
         ys = torch.tensor([self.y[i] for i in idx], device=device)
         return xs, ys
 
-buf = ReplayBuf(REPLAY_CAP)
+
+class BalancedReplayBuf:
+    """
+    Class–balanced reservoir replay.
+    • `cap` is the *total* number of exemplars the buffer may store.
+    • When the buffer is not full it just grows.
+    • Once full, every class that has appeared so far is allotted
+        floor(cap / #seen_classes)   slots (±1 for rounding).
+    • New items replace *random* items from their own class bucket
+      (reservoir sampling) so the per–class distribution stays uniform.
+    """
+    def __init__(self, cap, device=torch.device("cpu")):
+        self.cap     = cap
+        self.device  = device         # for `.sample()`
+        self.store   = {}             # cls → [tensor, …]
+
+    # ---------- helpers ----------
+    def _bucket_cap(self):
+        """current max size of each class bucket"""
+        return max(1, self.cap // len(self.store))
+
+    def _total_size(self):
+        return sum(len(v) for v in self.store.values())
+
+    # ---------- public API ----------
+    def add(self, xs, ys):
+        """
+        xs : Tensor [B, …]  (CPU or GPU)
+        ys : Tensor [B]     (CPU or GPU)
+        """
+        for x, y in zip(xs.cpu(), ys.cpu()):
+            c = int(y)
+
+            # ensure bucket exists
+            if c not in self.store:
+                self.store[c] = []
+
+            bucket = self.store[c]
+            b_cap  = self._bucket_cap()
+
+            if len(bucket) < b_cap:               # room inside bucket
+                bucket.append(x.clone())
+            else:                                 # bucket full → reservoir replace
+                k = random.randrange(len(bucket))
+                bucket[k] = x.clone()
+
+            # global overflow possible *only* when a NEW class appeared:
+            while self._total_size() > self.cap:
+                # trim random items from buckets that exceed the new cap
+                for cls, buf in list(self.store.items()):
+                    b_cap = self._bucket_cap()
+                    while len(buf) > b_cap:
+                        buf.pop(random.randrange(len(buf)))
+                    if self._total_size() <= self.cap:
+                        break
+
+    def sample(self, m):
+        """
+        Balanced sampling: try to draw ⌈m / #seen⌉ per class.
+        """
+        if self._total_size() == 0:
+            return None, None
+
+        per = max(1, m // len(self.store))
+        xs, ys = [], []
+        for cls, buf in self.store.items():
+            if not buf:
+                continue
+            idxs = random.sample(range(len(buf)), min(per, len(buf)))
+            xs.extend(buf[i] for i in idxs)
+            ys.extend([cls] * len(idxs))
+
+        if not xs:   # shouldn’t happen, but be safe
+            return None, None
+
+        xs = torch.stack(xs).to(self.device)
+        ys = torch.tensor(ys, device=self.device)
+        return xs, ys
+
+buf = BalancedReplayBuf(REPLAY_CAP, device = device)
 
 # ------------- mean-teacher EMA -----------------
 def ema(student, teacher, alpha=EMA_ALPHA):
@@ -126,7 +206,7 @@ class Net(nn.Module):
         zc = F.normalize(z[:, :D_CLS], p=2, dim=1)
         zt = F.normalize(z[:, D_CLS:], p=2, dim=1)
         cent = self.head(zt if replay_z is None else replay_z)
-        logits = self.fc(torch.cat([zc, cent.detach()], dim=1))
+        logits = self.fc(torch.cat([zc, cent], dim=1))
         return logits
 
 # -------------------------------------------------
@@ -174,7 +254,11 @@ for t, loader in enumerate(tasks):
             # current-task loss
             logits= student(x, None)
             loss = F.cross_entropy(logits, y) 
-            loss += orthogonality_loss(student.head.P)
+            #print(f"CE loss: {loss}") 
+
+            ortho = orthogonality_loss(student.head.P)
+            #print(f"ortho loss: {ortho}")
+            loss += ortho 
 
             # replay + OT-distill + Laplacian anchor
             xr, yr = buf.sample(REPLAY_MB)
@@ -187,12 +271,15 @@ for t, loader in enumerate(tasks):
                 logS = student(xr, None)
                 pS = F.softmax(logS / TAU, dim=1)
                 # Wasserstein distillation
-                wd = LAM_WD * wasserstein_distill(pS, pT)
-                loss += F.cross_entropy(logS, yr) + wd
+                wd = wasserstein_distill(pS, pT)
+                #print(f"wd loss: {wd}")
+                loss += F.cross_entropy(logS, yr) + LAM_WD* wd
+
                 # Laplacian anchor on teacher prototypes
                 if P_anchor is not None:
                     Delta = teacher.head.P - P_anchor
                     man = torch.trace(Delta.t() @ L_anchor @ Delta)
+                    #print(f"manifold loss: {man}")
                     loss += LAM_M * man
 
                 
